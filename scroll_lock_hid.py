@@ -1,98 +1,126 @@
+#!/usr/bin/env python3
+"""
+scrolllock_hid_bruteforce.py
+Tentativa de vários HID reports para acender/desligar LEDs (Scroll/Num/Caps).
+Uso:
+  sudo python ~/scrolllock_hid_bruteforce.py on
+  sudo python ~/scrolllock_hid_bruteforce.py off
+Opções adicionais podem ser adicionadas; essa versão foca em robustez.
+"""
+
 import hid
 import time
 import sys
+import logging
 
-
-'''
-Para ligar o LED:
-sudo python ~/scrolllock_hid_bruteforce.py on
-Para desligar o LED:
-sudo python ~/scrolllock_hid_bruteforce.py off
-'''
-
+# Ajuste para seu teclado
 VENDOR_ID = 0xC0F4
 PRODUCT_ID = 0x0FF5
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
 def pick_keyboard_path():
-    # Prioriza interface 0 (Keyboard), usage_page 1, usage 6
     cands = []
     for d in hid.enumerate():
-        if d.get('vendor_id') == VENDOR_ID and d.get('product_id') == PRODUCT_ID:
+        if d.get("vendor_id") == VENDOR_ID and d.get("product_id") == PRODUCT_ID:
             cands.append(d)
-    # Ordena para pegar interface 0 primeiro
-    cands.sort(key=lambda x: (x.get('interface_number', 99), x.get('usage_page', 999)))
+    if not cands:
+        return None
+    # prioriza interface 0 / usage_page 1
+    cands.sort(key=lambda x: (x.get("interface_number", 99), x.get("usage_page", 999)))
     for d in cands:
-        if d.get('interface_number') == 0 and d.get('usage_page') in (1, None):
-            return d['path']
-    # fallback: primeiro da lista
-    return cands[0]['path'] if cands else None
+        if d.get("interface_number") == 0 and d.get("usage_page") in (1, None):
+            return d["path"]
+    return cands[0]["path"]
 
 def try_write(dev, data, label):
     try:
         n = dev.write(bytearray(data))
-        print(f"[write] {label}: retornou {n}")
+        logging.info(f"[write] {label}: retornou {n}")
         time.sleep(0.05)
         return True
     except Exception as e:
-        print(f"[write] {label}: ERRO -> {e}")
+        logging.debug(f"[write] {label}: ERRO -> {e}")
         return False
 
 def try_feature(dev, data, label):
     try:
         n = dev.send_feature_report(bytearray(data))
-        print(f"[feature] {label}: retornou {n}")
+        logging.info(f"[feature] {label}: retornou {n}")
         time.sleep(0.05)
         return True
     except Exception as e:
-        print(f"[feature] {label}: ERRO -> {e}")
+        logging.debug(f"[feature] {label}: ERRO -> {e}")
         return False
 
-def main(on=True):
-    path = pick_keyboard_path()
-    if not path:
-        print("Não achei o hidraw do teclado alvo (C0F4:0FF5).")
-        sys.exit(1)
+def build_attempts(state):
+    """
+    Retorna uma lista de tuplas (fn, payload, label)
+    onde fn é try_write ou try_feature.
+    """
+    attempts = []
+    # formatos básicos
+    attempts.append((try_write,  [0x00, state], "write [0x00, state] (Output report ID 0)"))
+    attempts.append((try_write,  [state],       "write [state] (Output report sem ReportID)"))
+    attempts.append((try_feature,[0x00, state], "feature [0x00, state] (Feature report ID 0)"))
+    attempts.append((try_feature,[0x01, state], "feature [0x01, state] (Feature report ID 1)"))
+    # report IDs 1..4
+    for rid in (1,2,3,4):
+        attempts.append((try_write,  [rid, state], f"write [RID={rid}, state]"))
+        attempts.append((try_feature,[rid, state], f"feature [RID={rid}, state]"))
+    return attempts
 
-    print(f"Usando device path: {path!r}")
-
-    state = 0x01 if on else 0x00
-
+def run_attempts(path, on=True, delay=0.05):
+    state = 0x01 if on else 0x00  
+    logging.info(f"Usando device path: {path!r}")
     dev = hid.device()
-    dev.open_path(path)
-    # Alguns firmwares pedem não-bloqueante
+    try:
+        dev.open_path(path)
+    except Exception as e:
+        logging.error(f"Erro abrindo device: {e}")
+        return False
+
     try:
         dev.set_nonblocking(1)
     except Exception:
         pass
 
-    # Tentativas comuns
-    attempts = [
-        (try_write,        [0x00, state],              "write [0x00, state] (Output report c/ ReportID 0)"),
-        (try_write,        [state],                    "write [state] (Output report sem ReportID)"),
-        (try_feature,      [0x00, state],              "feature [0x00, state] (Feature report ID 0)"),
-        (try_feature,      [0x01, state],              "feature [0x01, state] (Feature report ID 1)"),
-    ]
-
-    # Alguns teclados usam report IDs 1..4 para LEDs
-    for rid in (1, 2, 3, 4):
-        attempts.append((try_write,   [rid, state],    f"write [RID={rid}, state]"))
-        attempts.append((try_feature, [rid, state],    f"feature [RID={rid}, state]"))
+    attempts = build_attempts(state)
 
     ok = False
     for fn, payload, label in attempts:
-        if fn(dev, payload, label):
+        res = fn(dev, payload, label)
+        # interpretamos qualquer tentativa que não jogou exceção como "tentativa feita"
+        if res:
             ok = True
-        time.sleep(0.05)
+        time.sleep(delay)
 
     dev.close()
+    return ok
 
-    if ok:
-        print("Terminei as tentativas. Veja se o LED mudou (alguns modelos aplicam após ~100ms).")
-    else:
-        print("Nenhuma chamada retornou sucesso. Pode ser que o firmware rejeite comandos diretos de LED.")
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: sudo python scrolllock_hid_bruteforce.py on|off")
+        return 1
+    action = sys.argv[1].lower()
+    on = (action != "off")
+
+    path = pick_keyboard_path()
+    if not path:
+        logging.error("Não achei o dispositivo HID alvo (verifique vendor/product).")
+        return 2
+
+    try:
+        ok = run_attempts(path, on=on, delay=0.05)
+        if ok:
+            logging.info("Tentativas concluídas. Verifique LED físico.")
+            return 0
+        else:
+            logging.warning("Nenhuma tentativa reportou sucesso (firmware pode rejeitar).")
+            return 3
+    except Exception as e:
+        logging.exception("Erro inesperado:")
+        return 4
 
 if __name__ == "__main__":
-    action = "on"
-    if len(sys.argv) > 1:
-        action = sys.argv[1].lower()
-    main(on=(action != "off"))
+    raise SystemExit(main())
